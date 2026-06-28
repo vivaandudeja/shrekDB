@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>shrekDB — chart</title>
+    <style>
+      :root {
+        --bg: #0f1419;
+        --panel: #161b22;
+        --line: #4ade80;
+        --grid: #232b36;
+        --text: #c9d1d9;
+        --muted: #768390;
+        --accent: #4ade80;
+        --sel: rgba(74, 222, 128, 0.18);
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.5 ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        padding: 12px 16px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--grid);
+        display: flex;
+        align-items: baseline;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      h1 { font-size: 15px; margin: 0; font-weight: 700; }
+      h1 .db { color: var(--accent); }
+      .stat { color: var(--muted); }
+      .stat b { color: var(--text); font-weight: 600; }
+      button {
+        font: inherit;
+        color: var(--text);
+        background: #21262d;
+        border: 1px solid var(--grid);
+        border-radius: 6px;
+        padding: 4px 10px;
+        cursor: pointer;
+      }
+      button:hover { border-color: var(--accent); }
+      main { flex: 1; position: relative; min-height: 0; }
+      canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+      footer {
+        padding: 6px 16px;
+        background: var(--panel);
+        border-top: 1px solid var(--grid);
+        color: var(--muted);
+        font-size: 12px;
+      }
+      #err {
+        position: absolute; inset: 0; display: none;
+        align-items: center; justify-content: center;
+        color: #f87171; text-align: center; padding: 24px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>shrek<span class="db">DB</span></h1>
+      <span class="stat">metric <b id="metric">–</b></span>
+      <span class="stat">records <b id="count">–</b></span>
+      <span class="stat">window <b id="range">–</b></span>
+      <span class="stat">showing <b id="shown">–</b></span>
+      <button id="reset">Reset zoom</button>
+    </header>
+    <main>
+      <canvas id="chart"></canvas>
+      <div id="err"></div>
+    </main>
+    <footer>Drag horizontally to zoom into a time window · double-click to reset · the server re-runs an LTTB query at your screen resolution on every change.</footer>
+
+    <script>
+      const canvas = document.getElementById('chart');
+      const ctx = canvas.getContext('2d');
+      const errEl = document.getElementById('err');
+      const PAD = { l: 64, r: 16, t: 16, b: 28 };
+
+      let full = null;            // { from, to } of the whole series
+      let view = null;            // current { from, to }
+      let points = [];            // current downsampled samples
+      let layout = null;          // pixel mapping for inverse lookups
+      let drag = null;            // { x0, x1 } during a drag-select
+
+      const fmtNum = (n) => n.toLocaleString();
+      const fmtTime = (ms) => {
+        const d = new Date(ms);
+        const span = view ? view.to - view.from : 0;
+        // Show date for wide windows, time-of-day for narrow ones.
+        return span > 2 * 864e5
+          ? d.toISOString().slice(0, 10)
+          : d.toISOString().slice(0, 19).replace('T', ' ');
+      };
+
+      function showError(msg) {
+        errEl.textContent = msg;
+        errEl.style.display = 'flex';
+      }
+
+      async function api(path) {
+        const res = await fetch(path);
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+        return res.json();
+      }
+
+      function cssSize() {
+        const r = canvas.getBoundingClientRect();
+        return { w: r.width, h: r.height };
+      }
+
+      function resize() {
+        const { w, h } = cssSize();
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.round(w * dpr);
+        canvas.height = Math.round(h * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        draw();
+      }
+
+      // Re-query the server for the current view at ~1 point per horizontal pixel.
+      async function refresh() {
+        if (!view) return;
+        const { w } = cssSize();
+        const max = Math.max(8, Math.round(w - PAD.l - PAD.r));
+        try {
+          const { total, points: pts } = await api(
+            `/api/query?from=${view.from}&to=${view.to}&max=${max}`,
+          );
+          points = pts;
+          document.getElementById('range').textContent =
+            `${fmtTime(view.from)} → ${fmtTime(view.to)}`;
+          document.getElementById('shown').textContent =
+            total > pts.length ? `${fmtNum(pts.length)} of ${fmtNum(total)}` : fmtNum(pts.length);
+          draw();
+        } catch (e) {
+          showError('Query failed: ' + e.message);
+        }
+      }
+
+      function draw() {
+        const { w, h } = cssSize();
+        ctx.clearRect(0, 0, w, h);
+        if (!view || points.length === 0) return;
+
+        const x0 = PAD.l, x1 = w - PAD.r, y0 = PAD.t, y1 = h - PAD.b;
+        let lo = Infinity, hi = -Infinity;
+        for (const p of points) { if (p.value < lo) lo = p.value; if (p.value > hi) hi = p.value; }
+        if (lo === hi) { lo -= 1; hi += 1; }
+        const pad = (hi - lo) * 0.08;
+        lo -= pad; hi += pad;
+
+        const sx = (t) => x0 + ((t - view.from) / (view.to - view.from || 1)) * (x1 - x0);
+        const sy = (v) => y1 - ((v - lo) / (hi - lo || 1)) * (y1 - y0);
+        layout = { x0, x1, y0, y1 };
+
+        // grid + y labels
+        ctx.strokeStyle = getCss('--grid');
+        ctx.fillStyle = getCss('--muted');
+        ctx.lineWidth = 1;
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'right';
+        for (let i = 0; i <= 4; i++) {
+          const v = lo + ((hi - lo) * i) / 4;
+          const y = sy(v);
+          ctx.globalAlpha = 0.5;
+          ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.fillText(v.toFixed(2), x0 - 8, y);
+        }
+
+        // x labels
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        for (let i = 0; i <= 4; i++) {
+          const t = view.from + ((view.to - view.from) * i) / 4;
+          const x = sx(t);
+          ctx.fillText(fmtTime(t), Math.min(Math.max(x, x0 + 28), x1 - 28), y1 + 8);
+        }
+
+        // the trend line
+        ctx.strokeStyle = getCss('--line');
+        ctx.lineWidth = 1.5;
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        points.forEach((p, i) => {
+          const x = sx(p.timestamp), y = sy(p.value);
+          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        // drag selection overlay
+        if (drag) {
+          const a = Math.min(drag.x0, drag.x1), b = Math.max(drag.x0, drag.x1);
+          ctx.fillStyle = getCss('--sel');
+          ctx.fillRect(a, y0, b - a, y1 - y0);
+        }
+      }
+
+      function getCss(name) {
+        return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      }
+
+      function timeAt(px) {
+        if (!layout) return view.from;
+        const f = (px - layout.x0) / (layout.x1 - layout.x0);
+        return view.from + Math.min(Math.max(f, 0), 1) * (view.to - view.from);
+      }
+
+      // ---- interactions ----
+      canvas.addEventListener('mousedown', (e) => {
+        const x = e.offsetX;
+        drag = { x0: x, x1: x };
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (!drag) return;
+        const rect = canvas.getBoundingClientRect();
+        drag.x1 = e.clientX - rect.left;
+        draw();
+      });
+      window.addEventListener('mouseup', () => {
+        if (!drag) return;
+        const a = Math.min(drag.x0, drag.x1), b = Math.max(drag.x0, drag.x1);
+        const dragged = b - a;
+        const from = timeAt(a), to = timeAt(b);
+        drag = null;
+        if (dragged > 4 && to > from) { view = { from: Math.round(from), to: Math.round(to) }; refresh(); }
+        else draw();
+      });
+      canvas.addEventListener('dblclick', () => { if (full) { view = { ...full }; refresh(); } });
+      document.getElementById('reset').addEventListener('click', () => {
+        if (full) { view = { ...full }; refresh(); }
+      });
+      window.addEventListener('resize', () => { resize(); refresh(); });
+
+      // ---- boot ----
+      (async () => {
+        try {
+          const info = await api('/api/info');
+          document.getElementById('metric').textContent = info.metricId;
+          document.getElementById('count').textContent = fmtNum(info.count);
+          if (info.count === 0 || info.from === null) { showError('File has no records.'); return; }
+          full = { from: info.from, to: info.to };
+          view = { ...full };
+          resize();
+          await refresh();
+        } catch (e) {
+          showError('Could not load file info: ' + e.message);
+        }
+      })();
+    </script>
+  </body>
+</html>
